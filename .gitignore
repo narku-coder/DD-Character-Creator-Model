@@ -1,0 +1,13 @@
+# Virtual Environments
+venv/
+.env
+
+# PyTorch weights & exported models
+*.pt
+*.pth
+*.onnx
+model_save/
+
+# Local datasets or text sheets
+*.txt
+*.csv

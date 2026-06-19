@@ -1,0 +1,24 @@
+name: dd_character_builder
+description: "A new Flutter project."
+publish_to: 'none'
+version: 0.1.0
+
+environment:
+  sdk: ^3.7.2
+
+dependencies:
+  flutter:
+    sdk: flutter
+  http: ^1.1.0          # To call your FastAPI backend
+  sqflite: ^2.3.0       # For saving chat history locally on Android
+  path_provider: ^2.1.1 # To find the Android documents directory
+  pdf: ^3.10.4          # To generate the visual character sheet
+  share_plus: ^7.1.0    # To let the user save/share the PDF
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
