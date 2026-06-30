@@ -224,7 +224,11 @@ app = FastAPI(title="D&D Generator API")
 class ChatRequest(BaseModel):
     session_id: str
     prompt: str
-
+    
+@app.get("/")
+def read_root():
+    return {"status": "D&D Generator API is live"}
+    
 @app.post("/generate")
 async def generate_character(request: ChatRequest):
     # 1. Log the User message
