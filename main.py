@@ -240,7 +240,8 @@ async def generate_character(request: ChatRequest):
         
         # 3. Apply RAG
         final_payload = enrich_character_data(base_json)
-        
+        print('Status: ${response.statusCode}');
+        print('Body: ${response.body}');
         if "error" in final_payload:
             raise HTTPException(status_code=400, detail=final_payload["error"])
         
