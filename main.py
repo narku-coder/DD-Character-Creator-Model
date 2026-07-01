@@ -1,21 +1,14 @@
 import os
 import json
 import re
+import uuid
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 import psycopg2
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
 
-
-# DB_PARAMS = {
-#     "dbname": "neondb",
-#     "user": "Narku_Model",
-#     "password": "V0113yba11ru135",
-#     "host": "ep-empty-butterfly-aq64mw79-pooler.c-8.us-east-1.aws.neon.tech", # or your Render DB external host
-#     "port": "5432"
-# } 
 DB_HOST = os.environ.get("DB_HOST", "localhost")
 DB_NAME = os.environ.get("DB_NAME", "neondb")
 DB_USER = os.environ.get("DB_USER", "postgres")
@@ -42,7 +35,6 @@ def save_message_to_db(session_id: str, role: str, content: str, is_json: bool):
 # ==========================================
 # 2. LOAD TOKENIZER DICTIONARIES
 # ==========================================
-# We load the JSON tokenizer we exported earlier so the model knows how to read strings.
 tokenizer_path = "dnd_tokenizer.json"
 if not os.path.exists(tokenizer_path):
     raise FileNotFoundError(f"Missing {tokenizer_path}. Cannot start API.")
@@ -51,7 +43,6 @@ with open(tokenizer_path, "r", encoding="utf-8") as f:
     tok_data = json.load(f)
 
 stoi = tok_data["stoi"]
-# JSON keys are always strings, so we must cast the 'itos' keys back to integers
 itos = {int(k): v for k, v in tok_data["itos"].items()}
 vocab_size = len(stoi)
 
@@ -64,12 +55,11 @@ def decode(l):
 # ==========================================
 # 3. TRANSFORMER ARCHITECTURE
 # ==========================================
-# These parameters MUST perfectly match what you used during training.
 block_size = 512
 n_embd = 128
 n_head = 4
 n_layer = 4
-device = 'cpu' # Render free/standard tiers run on CPU
+device = 'cpu'
 
 class Head(nn.Module):
     def __init__(self, head_size):
@@ -155,9 +145,8 @@ if not os.path.exists(model_path):
     raise FileNotFoundError(f"Missing {model_path}. Please train and export the model first.")
 
 print("Loading pre-trained weights into memory...")
-# map_location='cpu' is critical so it doesn't crash trying to find a GPU on Render
 model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
-model.eval() # Freeze the weights for inference
+model.eval() 
 model.to(device)
 print("Model ready!")
 
@@ -217,37 +206,73 @@ def enrich_character_data(char_json):
     return char_json
 
 # ==========================================
-# 6. FASTAPI ENDPOINTS
+# 6. FASTAPI ENDPOINTS & BACKGROUND TASKS
 # ==========================================
 app = FastAPI(title="D&D Generator API")
+
+# Temporary in-memory dictionary to hold task status
+tasks_db = {}
 
 class ChatRequest(BaseModel):
     session_id: str
     prompt: str
-    
+
 @app.get("/")
 def read_root():
     return {"status": "D&D Generator API is live"}
-    
+
+# This function runs in the background, keeping the HTTP route free
+def process_character_task(task_id: str, session_id: str, prompt: str):
+    print(f"[{task_id}] Task started.")
+    try:
+        # 1. Run Inference
+        base_json = generate_response(prompt)
+        
+        # 2. Apply RAG
+        final_payload = enrich_character_data(base_json)
+        
+        if "error" in final_payload:
+            tasks_db[task_id] = {"status": "failed", "error": final_payload["error"]}
+            print(f"[{task_id}] Task failed during generation.")
+            return
+            
+        # 3. Log the Assistant response to the database
+        save_message_to_db(session_id, "assistant", json.dumps(final_payload), is_json=True)
+        
+        # 4. Mark task as completed so Flutter can fetch the data
+        tasks_db[task_id] = {
+            "status": "completed",
+            "data": final_payload
+        }
+        print(f"[{task_id}] Task successfully completed.")
+        
+    except Exception as e:
+        tasks_db[task_id] = {"status": "failed", "error": str(e)}
+        print(f"[{task_id}] Task encountered an exception: {e}")
+
 @app.post("/generate")
-async def generate_character(request: ChatRequest):
-    # 1. Log the User message
+async def generate_character(request: ChatRequest, background_tasks: BackgroundTasks):
+    # 1. Log the User message immediately
     save_message_to_db(request.session_id, "user", request.prompt, is_json=False)
     
-    try:
-        # 2. Run Inference
-        base_json = generate_response(request.prompt)
+    # 2. Create a unique task ID
+    task_id = str(uuid.uuid4())
+    
+    # 3. Initialize the task status
+    tasks_db[task_id] = {"status": "processing"}
+    
+    # 4. Kick off the heavy PyTorch and Postgres processes in the background
+    background_tasks.add_task(process_character_task, task_id, request.session_id, request.prompt)
+    
+    # 5. Instantly return to Flutter so Render doesn't throw a 502 Timeout
+    return {"task_id": task_id, "status": "processing"}
+
+@app.get("/status/{task_id}")
+async def check_status(task_id: str):
+    # Flutter calls this route to check if the transformer is done
+    task_info = tasks_db.get(task_id)
+    
+    if not task_info:
+        raise HTTPException(status_code=404, detail="Task not found")
         
-        # 3. Apply RAG
-        final_payload = enrich_character_data(base_json)
-        print('Status: ${response.statusCode}');
-        print('Body: ${response.body}');
-        if "error" in final_payload:
-            raise HTTPException(status_code=400, detail=final_payload["error"])
-        
-        # 4. Log the Assistant response
-        save_message_to_db(request.session_id, "assistant", json.dumps(final_payload), is_json=True)
-            
-        return final_payload
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    return task_info
