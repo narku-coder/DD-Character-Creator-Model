@@ -157,11 +157,23 @@ def generate_response(user_query, max_new_tokens=400):
     formatted_prompt = f"<USER> {user_query} Output strictly in JSON format. <ASSISTANT>\n"
     idx = torch.tensor([encode(formatted_prompt)], dtype=torch.long).to(device)
     
+    temperature = 0.2  # Closer to 0.0 means stricter/less random.
+    top_k = 10         # Only allow it to pick from the top 10 most likely next tokens.
+    
     with torch.no_grad():
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -block_size:] if idx.size(1) > block_size else idx
             logits, _ = model(idx_cond)
             logits = logits[:, -1, :] 
+            
+            # 1. Apply Temperature Scaling (Makes confident guesses even stronger)
+            logits = logits / temperature
+            
+            # 2. Apply Top-K Filtering (Deletes the weird, low-probability guesses entirely)
+            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+            logits[logits < v[:, [-1]]] = -float('Inf')
+            
+            # Now we roll the dice on the newly filtered probabilities
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1) 
             idx = torch.cat((idx, idx_next), dim=1) 
