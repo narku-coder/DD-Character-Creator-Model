@@ -146,7 +146,9 @@ if not os.path.exists(model_path):
 
 print("Loading pre-trained weights into memory...")
 model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
-model.eval() 
+model.eval()
+model = torch.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+model = torch.compile(model)
 model.to(device)
 print("Model ready!")
 
