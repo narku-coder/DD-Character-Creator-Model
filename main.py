@@ -5,6 +5,7 @@ import uuid
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+import torch.quantization # Added for CPU speed optimization
 import psycopg2
 from fastapi import FastAPI, HTTPException, BackgroundTasks
 from pydantic import BaseModel
@@ -53,7 +54,7 @@ def decode(l):
     return ''.join([itos[i] for i in l])
 
 # ==========================================
-# 3. TRANSFORMER ARCHITECTURE
+# 3. TRANSFORMER ARCHITECTURE (KV CACHE ENABLED)
 # ==========================================
 block_size = 512
 n_embd = 128
@@ -69,15 +70,32 @@ class Head(nn.Module):
         self.value = nn.Linear(n_embd, head_size, bias=False)
         self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)))
 
-    def forward(self, x):
+    def forward(self, x, kv_cache=None):
         B, T, C = x.shape
         k = self.key(x)   
         q = self.query(x) 
-        wei = q @ k.transpose(-2, -1) * (C ** -0.5) 
-        wei = wei.masked_fill(self.tril[:T, :T] == 0, float('-inf'))
-        wei = F.softmax(wei, dim=-1)
         v = self.value(x) 
-        return wei @ v 
+
+        # If we have a cache from previous tokens, concatenate it to the current ones
+        if kv_cache is not None:
+            k_cache, v_cache = kv_cache
+            k = torch.cat([k_cache, k], dim=1)
+            v = torch.cat([v_cache, v], dim=1)
+            
+        new_kv_cache = (k, v)
+
+        wei = q @ k.transpose(-2, -1) * (C ** -0.5) 
+        
+        # Causal mask logic adjusted for KV caching
+        if T > 1:
+            T_full = k.shape[1]
+            T_cache = T_full - T
+            mask = torch.ones(T, T_full, device=self.tril.device)
+            mask[:, T_cache:] = self.tril[:T, :T]
+            wei = wei.masked_fill(mask == 0, float('-inf'))
+            
+        wei = F.softmax(wei, dim=-1)
+        return wei @ v, new_kv_cache
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, num_heads, head_size):
@@ -85,9 +103,19 @@ class MultiHeadAttention(nn.Module):
         self.heads = nn.ModuleList([Head(head_size) for _ in range(num_heads)])
         self.proj = nn.Linear(n_embd, n_embd)
 
-    def forward(self, x):
-        out = torch.cat([h(x) for h in self.heads], dim=-1)
-        return self.proj(out)
+    def forward(self, x, kv_cache=None):
+        if kv_cache is None:
+            kv_cache = [None] * len(self.heads)
+            
+        out_list = []
+        new_kv_cache = []
+        for i, h in enumerate(self.heads):
+            out, cache = h(x, kv_cache[i])
+            out_list.append(out)
+            new_kv_cache.append(cache)
+            
+        out = torch.cat(out_list, dim=-1)
+        return self.proj(out), new_kv_cache
 
 class FeedForward(nn.Module):
     def __init__(self, n_embd):
@@ -110,29 +138,48 @@ class Block(nn.Module):
         self.ln1 = nn.LayerNorm(n_embd)
         self.ln2 = nn.LayerNorm(n_embd)
 
-    def forward(self, x):
-        x = x + self.sa(self.ln1(x))
+    def forward(self, x, kv_cache=None):
+        sa_out, new_kv_cache = self.sa(self.ln1(x), kv_cache)
+        x = x + sa_out
         x = x + self.ffwd(self.ln2(x))
-        return x
+        return x, new_kv_cache
 
 class TransformerLanguageModel(nn.Module):
     def __init__(self, vocab_size):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        self.blocks = nn.Sequential(*[Block(n_embd, n_head=n_head) for _ in range(n_layer)])
+        # Switched to ModuleList so we can pass the cache sequentially
+        self.blocks = nn.ModuleList([Block(n_embd, n_head=n_head) for _ in range(n_layer)])
         self.ln_f = nn.LayerNorm(n_embd) 
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, kv_cache=None):
         B, T = idx.shape
+        
+        # Determine current positional indices based on cache length
+        if kv_cache is None:
+            pos_idx = torch.arange(T, device=device)
+        else:
+            past_length = kv_cache[0][0][0].shape[1]
+            pos_idx = torch.arange(past_length, past_length + T, device=device)
+            pos_idx = torch.clamp(pos_idx, max=block_size - 1)
+            
         tok_emb = self.token_embedding_table(idx) 
-        pos_emb = self.position_embedding_table(torch.arange(T, device=device)) 
+        pos_emb = self.position_embedding_table(pos_idx) 
         x = tok_emb + pos_emb 
-        x = self.blocks(x) 
+        
+        if kv_cache is None:
+            kv_cache = [None] * len(self.blocks)
+            
+        new_kv_cache = []
+        for i, block in enumerate(self.blocks):
+            x, cache = block(x, kv_cache[i])
+            new_kv_cache.append(cache)
+            
         x = self.ln_f(x) 
         logits = self.lm_head(x) 
-        return logits, None
+        return logits, new_kv_cache
 
 # ==========================================
 # 4. INITIALIZE & LOAD PRE-TRAINED WEIGHTS
@@ -146,9 +193,12 @@ if not os.path.exists(model_path):
 
 print("Loading pre-trained weights into memory...")
 model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
-model.eval()
+model.eval() 
+
+# Optimize CPU Inference by quantizing Linear layers down to 8-bit
+print("Quantizing model to INT8 for faster CPU inference...")
 model = torch.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
-model = torch.compile(model)
+
 model.to(device)
 print("Model ready!")
 
@@ -159,31 +209,47 @@ def generate_response(user_query, max_new_tokens=400):
     formatted_prompt = f"<USER> {user_query} Output strictly in JSON format. <ASSISTANT>\n"
     idx = torch.tensor([encode(formatted_prompt)], dtype=torch.long).to(device)
     
-    temperature = 0.2  # Closer to 0.0 means stricter/less random.
-    top_k = 10         # Only allow it to pick from the top 10 most likely next tokens.
+    # Deterministic Settings
+    temperature = 0.2  
+    top_k = 10         
+    
+    if idx.size(1) > block_size:
+        idx = idx[:, -block_size:]
+        
+    full_sequence = idx.tolist()[0]
     
     with torch.no_grad():
+        # Step 1: Feed the entire prompt ONCE to fill the KV Cache
+        logits, kv_cache = model(idx, kv_cache=None)
+        next_logits = logits[:, -1, :]
+        
         for _ in range(max_new_tokens):
-            idx_cond = idx[:, -block_size:] if idx.size(1) > block_size else idx
-            logits, _ = model(idx_cond)
-            logits = logits[:, -1, :] 
+            # Apply Temperature Scaling and Top-K Filtering
+            next_logits = next_logits / temperature
+            v, _ = torch.topk(next_logits, min(top_k, next_logits.size(-1)))
+            next_logits[next_logits < v[:, [-1]]] = -float('Inf')
             
-            # 1. Apply Temperature Scaling (Makes confident guesses even stronger)
-            logits = logits / temperature
-            
-            # 2. Apply Top-K Filtering (Deletes the weird, low-probability guesses entirely)
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            logits[logits < v[:, [-1]]] = -float('Inf')
-            
-            # Now we roll the dice on the newly filtered probabilities
-            probs = F.softmax(logits, dim=-1)
+            # Predict the next token
+            probs = F.softmax(next_logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1) 
-            idx = torch.cat((idx, idx_next), dim=1) 
             
-            if "<END>" in decode(idx[0].tolist()):
+            full_sequence.append(idx_next.item())
+            if "<END>" in decode([idx_next.item()]):
                 break
                 
-    full_text = decode(idx[0].tolist())
+            # Sliding Window fallback if the output gets too long for the buffer
+            current_length = kv_cache[0][0][0].shape[1]
+            if current_length >= block_size - 1:
+                context_idx = torch.tensor([full_sequence[-(block_size-1):]], dtype=torch.long).to(device)
+                logits, kv_cache = model(context_idx, kv_cache=None)
+                next_logits = logits[:, -1, :]
+                continue
+                
+            # Step 2: Pass ONLY the new token forward, utilizing the KV Cache
+            logits, kv_cache = model(idx_next, kv_cache=kv_cache)
+            next_logits = logits[:, -1, :]
+            
+    full_text = decode(full_sequence)
     raw_output = full_text.split("<ASSISTANT>\n")[-1].replace("<END>", "").strip()
     
     json_match = re.search(r'\{.*\}', raw_output, re.DOTALL)
@@ -224,7 +290,6 @@ def enrich_character_data(char_json):
 # ==========================================
 app = FastAPI(title="D&D Generator API")
 
-# Temporary in-memory dictionary to hold task status
 tasks_db = {}
 
 class ChatRequest(BaseModel):
@@ -235,14 +300,10 @@ class ChatRequest(BaseModel):
 def read_root():
     return {"status": "D&D Generator API is live"}
 
-# This function runs in the background, keeping the HTTP route free
 def process_character_task(task_id: str, session_id: str, prompt: str):
     print(f"[{task_id}] Task started.")
     try:
-        # 1. Run Inference
         base_json = generate_response(prompt)
-        
-        # 2. Apply RAG
         final_payload = enrich_character_data(base_json)
         
         if "error" in final_payload:
@@ -250,10 +311,8 @@ def process_character_task(task_id: str, session_id: str, prompt: str):
             print(f"[{task_id}] Task failed during generation.")
             return
             
-        # 3. Log the Assistant response to the database
         save_message_to_db(session_id, "assistant", json.dumps(final_payload), is_json=True)
         
-        # 4. Mark task as completed so Flutter can fetch the data
         tasks_db[task_id] = {
             "status": "completed",
             "data": final_payload
@@ -266,24 +325,17 @@ def process_character_task(task_id: str, session_id: str, prompt: str):
 
 @app.post("/generate")
 async def generate_character(request: ChatRequest, background_tasks: BackgroundTasks):
-    # 1. Log the User message immediately
     save_message_to_db(request.session_id, "user", request.prompt, is_json=False)
     
-    # 2. Create a unique task ID
     task_id = str(uuid.uuid4())
-    
-    # 3. Initialize the task status
     tasks_db[task_id] = {"status": "processing"}
     
-    # 4. Kick off the heavy PyTorch and Postgres processes in the background
     background_tasks.add_task(process_character_task, task_id, request.session_id, request.prompt)
     
-    # 5. Instantly return to Flutter so Render doesn't throw a 502 Timeout
     return {"task_id": task_id, "status": "processing"}
 
 @app.get("/status/{task_id}")
 async def check_status(task_id: str):
-    # Flutter calls this route to check if the transformer is done
     task_info = tasks_db.get(task_id)
     
     if not task_info:
