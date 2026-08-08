@@ -60,7 +60,14 @@ block_size = 512
 n_embd = 128
 n_head = 4
 n_layer = 4
-device = 'cpu'
+
+# Detect and set optimal hardware device
+if torch.cuda.is_available():
+    device = 'cuda'
+elif torch.backends.mps.is_available():
+    device = 'mps'
+else:
+    device = 'cpu'
 
 class Head(nn.Module):
     def __init__(self, head_size):
@@ -184,7 +191,7 @@ class TransformerLanguageModel(nn.Module):
 # ==========================================
 # 4. INITIALIZE & LOAD PRE-TRAINED WEIGHTS
 # ==========================================
-print("Initializing model architecture...")
+print(f"Initializing model architecture on {device.upper()}...")
 model = TransformerLanguageModel(vocab_size)
 
 model_path = "dnd_transformer.pt"
@@ -192,12 +199,17 @@ if not os.path.exists(model_path):
     raise FileNotFoundError(f"Missing {model_path}. Please train and export the model first.")
 
 print("Loading pre-trained weights into memory...")
-model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')))
+# Load weights directly to the determined device
+model.load_state_dict(torch.load(model_path, map_location=device, weights_only=True))
 model.eval() 
 
-# Optimize CPU Inference by quantizing Linear layers down to 8-bit
-print("Quantizing model to INT8 for faster CPU inference...")
-model = torch.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+# Hardware-specific optimizations
+if device == 'cpu':
+    print("Quantizing model to INT8 for faster CPU inference...")
+    model = torch.quantization.quantize_dynamic(model, {nn.Linear}, dtype=torch.qint8)
+else:
+    print(f"Converting model to float16 to maximize {device.upper()} performance...")
+    model = model.half() 
 
 model.to(device)
 print("Model ready!")
